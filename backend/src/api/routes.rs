@@ -224,6 +224,14 @@ pub fn create_router(state: SharedState) -> Router {
                 upload_admission,
             ),
         )
+        // Device Authorization Grant (#3461): the browser approval page. 404
+        // unless DEVICE_AUTH_ENABLED=true.
+        .merge(
+            handlers::device::device_page_router().route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                handlers::device::require_device_auth_enabled,
+            )),
+        )
         // Docker Registry V2 API (OCI Distribution Spec)
         .route("/v2/", handlers::oci_v2::version_check_handler())
         // `/v2/token` shares the login limiter's global backstop and failed-
@@ -761,6 +769,41 @@ fn api_v1_routes(
         )
         .named("password_change"),
     );
+    // Device Authorization Grant (#3461). Starting a flow is unauthenticated
+    // and writes a row, so it gets its own tight per-IP bucket
+    // (DEVICE_AUTH_CODE_REQUESTS_PER_WINDOW, default 10). Token polling gets
+    // a bucket sized like the other public auth endpoints but separate from
+    // theirs, so a polling CLI never spends a user's refresh/logout budget;
+    // per-code pacing is enforced by `slow_down` itself. The signed-in
+    // verify/approve/deny calls get a per-user bucket of the same size, also
+    // separate from refresh/logout.
+    let device_code_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.device_auth.code_requests_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("device_code"),
+    );
+    let device_token_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_auth_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("device_token"),
+    );
+    let device_approval_rate_limiter = Arc::new(
+        RateLimiter::new(
+            state.config.rate_limit_auth_per_window,
+            state.config.rate_limit_window_secs,
+        )
+        .named("device_approval"),
+    );
+    // Failed user-code budgets (per user and per IP) for verify/approve/deny.
+    // Always on: see `DeviceApprovalThrottle`.
+    let device_approval_throttle = handlers::device::DeviceApprovalThrottle::new(
+        &state.config.device_auth,
+        Arc::clone(&trusted_proxies),
+    );
 
     // Master on/off switch (#1602). When disabled, every rate-limit layer
     // short-circuits before touching its limiter so no request is limited.
@@ -810,6 +853,24 @@ fn api_v1_routes(
         enabled: rate_limit_enabled,
         trusted_proxies: Arc::clone(&trusted_proxies),
     };
+    let device_code_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&device_code_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
+    };
+    let device_token_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&device_token_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
+    };
+    let device_approval_rate_limit_state = RateLimitState {
+        limiter: Arc::clone(&device_approval_rate_limiter),
+        exemptions: Arc::clone(&exemptions),
+        enabled: rate_limit_enabled,
+        trusted_proxies: Arc::clone(&trusted_proxies),
+    };
 
     // Spawn periodic cleanup of expired rate-limiter entries to prevent
     // unbounded HashMap growth from unique client IPs over time.
@@ -822,6 +883,11 @@ fn api_v1_routes(
         let login_cleanup = Arc::clone(&login_rate_limit_state.inner.limiter);
         let login_failed_ip_cleanup = Arc::clone(&login_rate_limit_state.failed_by_ip);
         let password_change_cleanup = Arc::clone(&password_change_rate_limiter);
+        let device_code_cleanup = Arc::clone(&device_code_rate_limiter);
+        let device_token_cleanup = Arc::clone(&device_token_rate_limiter);
+        let device_approval_cleanup = Arc::clone(&device_approval_rate_limiter);
+        let device_throttle_cleanup = device_approval_throttle.clone();
+        let device_db = state.db.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
@@ -834,6 +900,14 @@ fn api_v1_routes(
                 login_cleanup.cleanup_expired().await;
                 login_failed_ip_cleanup.cleanup_expired().await;
                 password_change_cleanup.cleanup_expired().await;
+                device_code_cleanup.cleanup_expired().await;
+                device_token_cleanup.cleanup_expired().await;
+                device_approval_cleanup.cleanup_expired().await;
+                device_throttle_cleanup.cleanup_expired().await;
+                // Delete expired device authorizations (and audit approvals
+                // nobody redeemed). Runs whether or not the grant is enabled,
+                // so disabling it also drains the table.
+                handlers::device::sweep_expired_sessions(device_db.clone()).await;
             }
         });
     }
@@ -902,6 +976,64 @@ fn api_v1_routes(
         .nest("/auth/sso", handlers::sso::router())
         // CI OIDC token exchange (public, no auth — JWT is the credential)
         .nest("/auth/ci", handlers::ci_auth::router())
+        // Device Authorization Grant (RFC 8628, #3461). Every route answers
+        // 404 unless DEVICE_AUTH_ENABLED=true. Bodies are tiny, so cap them
+        // well below the global upload limit these routes would otherwise
+        // inherit: /code and /token buffer an unauthenticated body.
+        .nest(
+            "/auth/device",
+            Router::new()
+                // Public client endpoints: per-IP limiters, 429s re-shaped
+                // into the RFC 6749 §5.2 error body.
+                .merge(
+                    Router::new()
+                        .route(
+                            "/code",
+                            axum::routing::post(handlers::device::create_device_code),
+                        )
+                        .layer(middleware::from_fn_with_state(
+                            device_code_rate_limit_state,
+                            rate_limit_middleware,
+                        ))
+                        .layer(middleware::from_fn(
+                            handlers::device::oauth_rate_limit_response,
+                        )),
+                )
+                .merge(
+                    Router::new()
+                        .route(
+                            "/token",
+                            axum::routing::post(handlers::device::poll_device_token),
+                        )
+                        .layer(middleware::from_fn_with_state(
+                            device_token_rate_limit_state,
+                            rate_limit_middleware,
+                        ))
+                        .layer(middleware::from_fn(
+                            handlers::device::oauth_rate_limit_response,
+                        )),
+                )
+                // Signed-in user endpoints: session auth (with its CSRF
+                // contract), a per-user request budget, and the failed-code
+                // throttle the handlers consult.
+                .merge(
+                    handlers::device::approval_router()
+                        .layer(axum::Extension(device_approval_throttle))
+                        .layer(middleware::from_fn_with_state(
+                            device_approval_rate_limit_state,
+                            rate_limit_middleware,
+                        ))
+                        .layer(middleware::from_fn_with_state(
+                            auth_service.clone(),
+                            auth_middleware,
+                        )),
+                )
+                .layer(DefaultBodyLimit::max(16 * 1024))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    handlers::device::require_device_auth_enabled,
+                )),
+        )
         .nest(
             "/auth",
             handlers::auth::protected_router().layer(middleware::from_fn_with_state(
@@ -1572,7 +1704,16 @@ mod tests {
         assert_eq!(login.inner.limiter.name(), "login");
         assert_eq!(login.backstop.name(), "login_global");
         assert_eq!(token.inner.limiter.name(), "token");
-        for name in ["auth", "api", "search", "presign", "password_change"] {
+        for name in [
+            "auth",
+            "api",
+            "search",
+            "presign",
+            "password_change",
+            "device_code",
+            "device_token",
+            "device_approval",
+        ] {
             assert!(
                 ROUTES_RS_SRC.contains(&format!(".named(\"{name}\")")),
                 "the {name} limiter must be named for ak_rate_limit_rejections_total"
