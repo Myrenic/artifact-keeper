@@ -17,6 +17,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::services::auth_config_service::AuthConfigService;
+use crate::services::hidden_nav_items;
 
 /// Router for the system configuration endpoint.
 ///
@@ -143,6 +144,16 @@ fn admin_break_glass_available(sso_enabled: bool, disable_admin_break_glass: boo
     !(sso_enabled && disable_admin_break_glass)
 }
 
+/// Web UI presentation settings an administrator chose for every user.
+#[derive(Serialize, ToSchema, Default)]
+pub struct UiConfig {
+    /// Navigation entries the web UI hides from its sidebar (#4574), as
+    /// opaque identifiers the web UI defines (route paths such as `/peers`).
+    /// Display only: hidden pages stay reachable and keep their permission
+    /// checks. Empty means every entry is shown.
+    pub hidden_nav_items: Vec<String>,
+}
+
 /// Runtime configuration values.
 ///
 /// This response intentionally omits all secrets, credentials, and internal
@@ -178,6 +189,9 @@ pub struct SystemConfigResponse {
     /// clients to initiate the OIDC flow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oidc_issuer: Option<String>,
+    /// Web UI presentation settings. Public-safe: the navigation shown to a
+    /// guest depends on it, and it only names menu entries.
+    pub ui: UiConfig,
     /// Scanner availability. Admin-only (security posture).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scanners: Option<ScannersConfig>,
@@ -256,6 +270,11 @@ pub async fn get_system_config(
         }),
         silent_sso_enabled: config.oidc_silent_sso_enabled,
     };
+    // Fails open to "nothing hidden" so a settings read error never empties
+    // the sidebar.
+    let ui = UiConfig {
+        hidden_nav_items: hidden_nav_items::load_or_default(&state.db).await,
+    };
 
     // Non-admin / anonymous callers receive only the public-safe subset. The
     // sensitive security-posture fields stay `None` and are dropped from the
@@ -267,6 +286,7 @@ pub async fn get_system_config(
             guest_access_enabled,
             auth: auth_config,
             oidc_issuer: config.oidc_issuer.clone(),
+            ui,
             scanners: None,
             search_engine: None,
             storage_backend: None,
@@ -327,6 +347,7 @@ pub async fn get_system_config(
         guest_access_enabled,
         auth: auth_config,
         oidc_issuer: config.oidc_issuer.clone(),
+        ui,
         scanners: Some(scanners),
         search_engine: Some(search_engine),
         storage_backend: Some(config.storage_backend.clone()),
@@ -343,7 +364,8 @@ pub async fn get_system_config(
         ScannersConfig,
         AuthConfig,
         PermissionsConfig,
-        PluginSigningConfig
+        PluginSigningConfig,
+        UiConfig
     ))
 )]
 pub struct SystemConfigApiDoc;
@@ -376,6 +398,7 @@ mod tests {
                 silent_sso_enabled: true,
             },
             oidc_issuer: None,
+            ui: UiConfig::default(),
             permissions: Some(PermissionsConfig {
                 rules_exist: false,
                 enforcement_enabled: false,
@@ -446,6 +469,7 @@ mod tests {
                 silent_sso_enabled: false,
             },
             oidc_issuer: Some("https://auth.example.com".to_string()),
+            ui: UiConfig::default(),
             permissions: Some(PermissionsConfig {
                 rules_exist: true,
                 enforcement_enabled: true,
@@ -566,6 +590,7 @@ mod tests {
     fn test_system_config_oidc_issuer_present_when_some() {
         let response = SystemConfigResponse {
             oidc_issuer: Some("https://accounts.google.com".to_string()),
+            ui: UiConfig::default(),
             auth: AuthConfig {
                 oidc_enabled: true,
                 ldap_enabled: false,
@@ -824,6 +849,51 @@ mod tests {
             !obj.contains_key("plugin_signing"),
             "plugin_signing leaked to anon"
         );
+    }
+
+    /// #4574: the stored hidden navigation entries reach an anonymous caller
+    /// as `ui.hidden_nav_items` (guests see the sidebar too), and a stored
+    /// value that is not a list of strings reads as nothing hidden.
+    #[tokio::test]
+    async fn test_handler_anonymous_gets_hidden_nav_items_4574() {
+        use crate::services::hidden_nav_items;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::hidden_nav_items_serial_lock().await;
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let before = hidden_nav_items::try_load(&pool).await.expect("read");
+        let state = tdh::build_state(pool.clone(), "/tmp/sysconfig-4574");
+
+        hidden_nav_items::store(&pool, &["/peers".to_string()], user_id)
+            .await
+            .expect("store");
+        let stored = call_handler(state.clone(), None).await;
+        sqlx::query("UPDATE system_settings SET value = '{\"not\": \"a list\"}' WHERE key = $1")
+            .bind(hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY)
+            .execute(&pool)
+            .await
+            .expect("corrupt setting");
+        let malformed = call_handler(state, None).await;
+
+        if before.is_empty() {
+            sqlx::query("DELETE FROM system_settings WHERE key = $1")
+                .bind(hidden_nav_items::HIDDEN_NAV_ITEMS_SETTING_KEY)
+                .execute(&pool)
+                .await
+                .expect("cleanup setting");
+        } else {
+            hidden_nav_items::store(&pool, &before, user_id)
+                .await
+                .expect("restore setting");
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert_eq!(
+            stored["ui"]["hidden_nav_items"],
+            serde_json::json!(["/peers"])
+        );
+        assert_eq!(malformed["ui"]["hidden_nav_items"], serde_json::json!([]));
     }
 
     /// Authenticated non-admin caller: same redaction as anonymous — the
