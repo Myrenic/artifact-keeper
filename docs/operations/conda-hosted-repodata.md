@@ -142,6 +142,67 @@ not listen on it, are not affected during a rolling upgrade: on the shared
 channel they would answer every unknown event with a conservative flush of
 their authorization caches.
 
+## Remote channels whose upstream has no shard index
+
+A Remote conda repository proxies its upstream's CEP-16 shard index when the
+upstream publishes one. From 1.12.0, when it does not (most private channels
+and older mirrors publish only `repodata.json` and its `.zst`/`.bz2`), the
+remote synthesises the shards itself (#4178), so CEP-16 clients of it fetch
+shards instead of the whole index, and a virtual channel's shard index can
+include that member instead of dropping to `repodata.json` for everyone.
+
+- **Source.** The upstream document the plain `repodata.json` proxy already
+  reads and caches: `repodata.json.zst`, else `.bz2`, else `repodata.json`.
+  It is decoded as a stream and parsed record by record; records are spilled
+  to 64 temporary files (in the process's temporary directory) by package
+  name, and each file is then grouped into shards. The plain JSON of the index
+  is never held. Measured on the reference host with conda-forge documents
+  (debug build, single thread; peak resident set of the whole test process):
+
+  | Document | Compressed | Records | Names | Shard bytes | Peak RSS |
+  |---|---|---|---|---|---|
+  | `noarch/repodata.json.zst` | 29 MB | 387,298 | 23,959 | 36 MB | 97 MiB |
+  | `linux-64/repodata.json.zst` | 59 MB | 799,329 | 14,173 | 68 MB | 143 MiB |
+
+  The compressed document itself (under the 128 MiB metadata ceiling) is held
+  while it is read, as for any proxied metadata read. An upstream that
+  publishes only the plain `repodata.json` is held as fetched, under the same
+  ceiling.
+- **Storage.** The shards go into `conda_shard_index` with
+  `origin = 'synthesized'`, the served revision into
+  `conda_subdir_revisions`, and `conda_synthesized_subdirs` records the
+  upstream document (path and SHA-256) they were built from. A rebuild writes
+  the changed shards, deletes the names the upstream dropped and bumps the
+  revision in one transaction, so a reader sees the old set or the new one.
+  Shards are checked against their address before they are served.
+- **Refresh.** While the proxy cache entry of that document is fresh and
+  still holds the recorded SHA-256, the stored shards are served with no read
+  of the document. Past the entry's TTL (the remote's metadata TTL,
+  `cache_ttl_secs`) the next shard index request fetches it through the
+  proxy: the same bytes change nothing; different bytes mark the subdir stale
+  and rebuild it. A stale index is not served: the request waits for the
+  rebuild like any other render (`AK_CONDA_REGEN_CONCURRENCY`,
+  `AK_CONDA_REGEN_WAIT_SECS`, then `503` with `Retry-After`).
+- **Bounds.** The decoded document is refused past
+  `CONDA_VIRTUAL_MEMBER_MAX_DECODED_BYTES` (1 GiB by default, the virtual
+  merge's member ceiling), one record past 16 MiB, and one package name whose
+  records pass 64 MiB (conda-forge's largest record is about 5 KB and its
+  largest name, `awscli` on linux-64, about 7 MB). A refused or unparseable
+  upstream document answers `502`; nothing is stored and the subdir stays
+  stale, so no index is served from it.
+- **Temporary space.** The spill files take about the decoded size of the
+  document (about 460 MB for conda-forge linux-64) under `TMPDIR` while the
+  rebuild runs, in a directory named `ak-conda-shard-synth-*` that is removed
+  when the rebuild ends, fails or panics (a process killed outright leaves it
+  behind). A full, read-only or missing `TMPDIR` fails the rebuild with `500`
+  and an error log naming the spill files; nothing is stored.
+- An upstream that does publish a shard index, but one past the 64 MiB
+  shard-index ceiling (#4612), is not synthesised: its shard index keeps
+  answering `404` and a virtual with that member serves none for the subdir,
+  so clients use `repodata.json`.
+- A subdir the upstream publishes no `repodata.json` for at all still answers
+  `404` on the shard index, and keeps a virtual off CEP-16 for that subdir.
+
 ## Backfill of existing channels
 
 The migration marks every hosted conda repository that exists at upgrade
